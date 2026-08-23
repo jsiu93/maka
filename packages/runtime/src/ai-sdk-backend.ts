@@ -253,20 +253,11 @@ import {
 import {
   applyRuntimeEventContextBudget,
   buildContextBudgetDiagnosticShell,
-  buildHistoryCompactBlockFromSummary,
-  buildHistorySearchSource,
   buildPromptSegmentEstimates,
   estimateRuntimeEventsTokens,
-  hasOversizedRetainedHistoryTurn,
   mergeContextBudgetDiagnostic,
   mergeContextBudgetDiagnosticPatches,
-  mergeRuntimeEventsInOriginalOrder,
   minimalContextBudgetDiagnostic,
-  rawEvidenceRequestReason,
-  retrieveArchivedToolResultsForReplay,
-  retrieveReplayHistoryAroundSearchSource,
-  retrieveRuntimeEventHistoryAround,
-  runtimeEventTurnKey,
   shouldAppendContextCompactedNote,
   shouldAppendContextCompactionFailedOpenNote,
   type ContextBudgetPolicy,
@@ -274,9 +265,7 @@ import {
 import {
   evaluateHistoryCompactCheckpointReplay,
   isHistoryCompactContentEvent,
-  replaceHistoryCompactReplayBlocks,
-} from './history-compact.js';
-import { selectSynthesisCacheForReplay } from './synthesis-cache.js';
+} from './history-compaction.js';
 import {
   canContinueHistoryCompactCheckpointForModel,
   historyCompactCheckpointToModelMessage,
@@ -697,21 +686,9 @@ export type ToolTelemetryRecorder = (record: ToolInvocationRecord) => void;
 export type {
   HistoryCompactCheckpointLoader,
   HistoryCompactCheckpointRecorder,
-  HistoryCompactLoader,
-  HistoryCompactLoadInput,
-  HistoryCompactLoadResult,
   HistoryCompactSummarizer,
   HistoryCompactSummaryInput,
-  HistoryCompactWriter,
-  HistoryCompactWriteInput,
-  HistoryCompactWriteResult,
   SemanticCompactBlockRecorder,
-  SynthesisCacheLoader,
-  SynthesisCacheLoadInput,
-  SynthesisCacheLoadResult,
-  SynthesisCacheWriter,
-  SynthesisCacheWriteInput,
-  SynthesisCacheWriteResult,
 } from './ai-sdk-compaction-contract.js';
 
 export interface AiSdkBackendInput extends AiSdkCompactionCapabilities {
@@ -3511,45 +3488,9 @@ export class AiSdkBackend implements AgentBackend {
     const preparedContextBudget =
       await this.compaction.prepareContextBudgetPolicy(priorRuntimeContext);
     let contextBudget = preparedContextBudget.policy;
-    let budgeted = applyRuntimeEventContextBudget(priorRuntimeContext, contextBudget, {
-      historyCompactProtocol:
-        contextBudget?.historyCompact?.checkpoint ||
-        this.compaction.hasHistoryCompactCheckpointWriter()
-          ? 'checkpoint_v2'
-          : 'legacy_v1',
-    });
-    const oversizedRetainedTurn = hasOversizedRetainedHistoryTurn(
-      budgeted?.events ?? priorRuntimeContext,
-      contextBudget,
-    );
-    let contextBudgetExhaustedDetail: ContextBudgetExhaustedDetail | undefined =
-      oversizedRetainedTurn && contextBudget?.historyCompact?.enabled !== true
-        ? 'no_safe_completed_span'
-        : undefined;
-    if (oversizedRetainedTurn && contextBudget?.historyCompact?.enabled === true) {
-      const overflowRecoveryPolicy: ContextBudgetPolicy = {
-        ...contextBudget,
-        minRecentTurns: 0,
-        historyCompact: {
-          ...contextBudget.historyCompact,
-          minRecentTurns: 0,
-        },
-      };
-      contextBudget = overflowRecoveryPolicy;
-      budgeted = applyRuntimeEventContextBudget(priorRuntimeContext, overflowRecoveryPolicy, {
-        historyCompactProtocol:
-          overflowRecoveryPolicy.historyCompact?.checkpoint ||
-          this.compaction.hasHistoryCompactCheckpointWriter()
-            ? 'checkpoint_v2'
-            : 'legacy_v1',
-      });
-    }
+    const budgeted = applyRuntimeEventContextBudget(priorRuntimeContext, contextBudget);
     let runtimeContext = budgeted?.events ?? priorRuntimeContext;
     let contextBudgetDiagnostic = budgeted?.diagnostic;
-    // The checkpoint this projection was replayed THROUGH, not the one the
-    // policy happens to carry: a loaded checkpoint that missed its prefix or
-    // failed the replay fit left the raw prefix in these events, and a caller
-    // asking what the prompt was built from must not be told otherwise (#2323).
     let projectedHistoryCompactCheckpoint = budgeted?.historyCompactCheckpoint;
     if (preparedContextBudget.diagnosticPatch) {
       contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
@@ -3558,266 +3499,88 @@ export class AiSdkBackend implements AgentBackend {
         preparedContextBudget.diagnosticPatch,
       );
     }
+
+    const maxHistoryTokens = contextBudget?.maxHistoryEstimatedTokens;
+    const needsCompaction =
+      maxHistoryTokens !== undefined &&
+      estimateRuntimeEventsTokens(runtimeContext, contextBudget?.charsPerToken) > maxHistoryTokens;
+    let compactionFailure: ContextBudgetExhaustedDetail | undefined;
     if (
-      budgeted?.historyCompactBlocks?.length &&
-      contextBudget?.historyCompact?.mode === 'read_write' &&
-      this.compaction.hasHistoryCompactWriter()
+      needsCompaction &&
+      contextBudget?.historyCompact?.enabled === true &&
+      this.compaction.hasHistoryCompactCheckpointWriter()
     ) {
-      const loadedBlockIds = new Set(
-        (contextBudget.historyCompact.blocks ?? []).map((block) => block.blockId),
+      const automaticMemoryDecision = automaticMemory
+        ? this.automaticMemoryCompactionDecision()
+        : undefined;
+      const automaticMemorySource = automaticMemoryDecision
+        ? lastNonCompactRuntimeEvent(priorRuntimeContext)
+        : undefined;
+      const compactResult = await this.compaction.compactHistory(
+        {
+          turnId: input.turnId,
+          runId: scope.runId,
+          runtimeContext: priorRuntimeContext,
+        },
+        this.priorRequestShape?.requestShapeHash,
+        automaticMemorySource
+          ? {
+              runId: automaticMemorySource.runId,
+              turnId: automaticMemorySource.turnId,
+              runtimeEventId: automaticMemorySource.id,
+              disposition: automaticMemoryDecision!.disposition,
+            }
+          : undefined,
       );
-      const draftBlocks = budgeted.historyCompactBlocks.filter(
-        (block) => !loadedBlockIds.has(block.blockId),
-      );
-      if (draftBlocks.length > 0) {
-        if (this.input.summarizeHistoryCompact && this.input.recordHistoryCompactCheckpoint) {
-          const automaticMemoryDecision = automaticMemory
-            ? this.automaticMemoryCompactionDecision()
-            : undefined;
-          const automaticMemoryBoundary = automaticMemoryDecision
-            ? lastNonCompactRuntimeEvent(priorRuntimeContext)
-            : undefined;
-          const writePatch = await this.compaction.writeHistoryCompactCheckpoint({
-            turnId: input.turnId,
-            // Stated, not resolved: this runs inside a send, and the backend
-            // may be serving another turn whose run is not this one (#1990).
-            runId: scope.runId,
-            contextBudget,
-            priorRuntimeContext,
-            draftBlock: draftBlocks[0]!,
-            abortSignal: scope.abortController.signal,
-            requestShapeHashBefore: this.priorRequestShape?.requestShapeHash,
-            ...(automaticMemoryBoundary
-              ? {
-                  automaticMemoryBoundary: {
-                    runId: automaticMemoryBoundary.runId,
-                    turnId: automaticMemoryBoundary.turnId,
-                    runtimeEventId: automaticMemoryBoundary.id,
-                    disposition: automaticMemoryDecision!.disposition,
-                  },
-                }
-              : {}),
-          });
-          if (writePatch.replacementCheckpoint) {
-            projectedHistoryCompactCheckpoint = writePatch.replacementCheckpoint;
-            if (automaticMemoryDecision?.dispatch && automaticMemory) {
-              this.dispatchAutomaticMemoryCompaction(scope, {
-                checkpoint: writePatch.replacementCheckpoint,
-                activeTools: [],
-              });
-            }
-            runtimeContext = [
-              ...(isTextHistoryCompactCheckpoint(writePatch.replacementCheckpoint)
-                ? [historyCompactCheckpointToRuntimeEvent(writePatch.replacementCheckpoint)]
-                : []),
-              ...runtimeContext.filter((event) => !event.id.startsWith('history-compact:')),
-            ];
-          } else {
-            if (oversizedRetainedTurn && !writePatch.fallbackCheckpoint) {
-              contextBudgetExhaustedDetail = 'summarizer_failed';
-            }
-            // Fail-open rebuilds the context around the older checkpoint, so
-            // that one — not the fold this send failed to write — is the
-            // boundary the prompt now stands on.
-            if (writePatch.fallbackCheckpoint) {
-              const fallback = buildHistoryCompactCheckpointFailOpenContext(
-                writePatch.fallbackCheckpoint,
-                priorRuntimeContext,
-                contextBudget,
-                runtimeContext.filter((event) => !event.id.startsWith('history-compact:')),
-              );
-              runtimeContext = fallback.events;
-              projectedHistoryCompactCheckpoint = fallback.checkpoint;
-            } else {
-              runtimeContext = runtimeContext.filter(
-                (event) => !event.id.startsWith('history-compact:'),
-              );
-              projectedHistoryCompactCheckpoint = undefined;
-            }
-          }
-          contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-            contextBudgetDiagnostic ??
-              buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-            writePatch.diagnosticPatch,
-          );
-        } else {
-          const writePatch = await this.compaction.writeHistoryCompactBlocks({
-            turnId: input.turnId,
-            contextBudget,
-            priorRuntimeContext,
-            draftBlocks,
-            abortSignal: scope.abortController.signal,
-            requestShapeHashBefore: this.priorRequestShape?.requestShapeHash,
-          });
-          if (writePatch.replacementBlocks.length > 0) {
-            runtimeContext = replaceHistoryCompactReplayBlocks(
-              runtimeContext,
-              writePatch.replacementBlocks,
-            );
-          } else {
-            // Back to the raw prior ledger: whatever boundary the projection
-            // stood on a moment ago is not in this context any more.
-            runtimeContext = priorRuntimeContext;
-            projectedHistoryCompactCheckpoint = undefined;
-            contextBudgetDiagnostic = buildContextBudgetDiagnosticShell(
-              priorRuntimeContext,
-              runtimeContext,
-              contextBudget,
-            );
-          }
-          contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-            contextBudgetDiagnostic ??
-              buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-            writePatch.diagnosticPatch,
-          );
+      let durableCheckpoint = compactResult.checkpoint;
+      if (!durableCheckpoint && compactResult.outcome.kind === 'unchanged') {
+        try {
+          durableCheckpoint = await Promise.resolve(this.input.loadHistoryCompactCheckpoint?.());
+        } catch {
+          durableCheckpoint = undefined;
         }
       }
+      if (durableCheckpoint) {
+        const replay = buildHistoryCompactCheckpointFailOpenContext(
+          durableCheckpoint,
+          priorRuntimeContext,
+          contextBudget!,
+          priorRuntimeContext,
+        );
+        runtimeContext = replay.events;
+        projectedHistoryCompactCheckpoint = replay.checkpoint;
+        if (
+          replay.checkpoint &&
+          compactResult.outcome.kind === 'compacted' &&
+          automaticMemoryDecision?.dispatch &&
+          automaticMemory
+        ) {
+          this.dispatchAutomaticMemoryCompaction(scope, {
+            checkpoint: replay.checkpoint,
+            activeTools: [],
+          });
+        }
+      }
+      if (compactResult.outcome.kind === 'failed') {
+        compactionFailure = 'summarizer_failed';
+      }
+      contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
+        contextBudgetDiagnostic ??
+          buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
+        compactResult.contextBudget ?? {},
+      );
     }
 
     if (
-      oversizedRetainedTurn &&
-      contextBudget?.maxHistoryEstimatedTokens !== undefined &&
-      estimateRuntimeEventsTokens(runtimeContext, contextBudget.charsPerToken) >
-        contextBudget.maxHistoryEstimatedTokens
+      maxHistoryTokens !== undefined &&
+      estimateRuntimeEventsTokens(runtimeContext, contextBudget?.charsPerToken) > maxHistoryTokens
     ) {
-      contextBudgetExhaustedDetail ??= 'no_safe_completed_span';
-    }
-    if (contextBudgetExhaustedDetail) {
       return {
         status: 'context_budget_exhausted',
-        detail: contextBudgetExhaustedDetail,
+        detail: compactionFailure ?? 'no_safe_completed_span',
         ...(contextBudgetDiagnostic ? { contextBudget: contextBudgetDiagnostic } : {}),
       };
     }
-
-    const historySearchSource = buildHistorySearchSource(priorRuntimeContext, contextBudget);
-    const historyAround =
-      contextBudget?.archiveRetrieval?.mode === 'history_search_gated'
-        ? retrieveReplayHistoryAroundSearchSource(
-            historySearchSource,
-            priorRuntimeContext,
-            input.text,
-            contextBudget?.historySearch,
-            { charsPerToken: contextBudget?.charsPerToken },
-          )
-        : retrieveRuntimeEventHistoryAround(
-            historySearchSource,
-            input.text,
-            contextBudget?.historySearch,
-            { charsPerToken: contextBudget?.charsPerToken },
-          );
-    const archiveRetrievalAllowedTurnIds =
-      contextBudget?.archiveRetrieval?.mode === 'history_search_gated'
-        ? new Set(historyAround.events.map((event) => runtimeEventTurnKey(event)))
-        : undefined;
-    if (historyAround.events.length > 0) {
-      runtimeContext = mergeRuntimeEventsInOriginalOrder(
-        priorRuntimeContext,
-        runtimeContext,
-        historyAround.events,
-      );
-      contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-        contextBudgetDiagnostic ??
-          buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-        historyAround.diagnosticPatch,
-      );
-    } else if (contextBudget?.historySearch?.enabled === true) {
-      contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-        contextBudgetDiagnostic ??
-          buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-        historyAround.diagnosticPatch,
-      );
-    }
-
-    const synthesis = selectSynthesisCacheForReplay(
-      runtimeContext,
-      input.text,
-      contextBudget?.synthesisCache,
-      {
-        sessionId: this.sessionId,
-        charsPerToken: contextBudget?.charsPerToken,
-      },
-    );
-    runtimeContext = synthesis.events;
-    if (contextBudget?.synthesisCache?.enabled === true) {
-      contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-        contextBudgetDiagnostic ??
-          buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-        synthesis.diagnosticPatch,
-      );
-    }
-
-    if (synthesis.selectedBlocks.length === 0) {
-      const retrieval = await retrieveArchivedToolResultsForReplay(
-        runtimeContext,
-        contextBudget?.archiveRetrieval,
-        this.input.toolResultArchive?.services.readToolResultArchive,
-        {
-          sessionId: this.sessionId,
-          charsPerToken: contextBudget?.charsPerToken,
-          allowedTurnIds: archiveRetrievalAllowedTurnIds,
-        },
-      );
-      runtimeContext = retrieval.events;
-      if (contextBudget?.archiveRetrieval?.enabled === true) {
-        contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-          contextBudgetDiagnostic ??
-            buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-          retrieval.diagnosticPatch,
-        );
-      }
-      if (
-        contextBudget?.synthesisCache?.enabled === true &&
-        contextBudget.synthesisCache.mode === 'read_write' &&
-        this.input.writeSynthesisCache &&
-        (retrieval.retrievedSourceRefs?.length ?? 0) > 0 &&
-        (retrieval.diagnosticPatch.retrievedArchiveToolResults ?? 0) > 0
-      ) {
-        const evidenceRequestReason = rawEvidenceRequestReason(input.text);
-        if (evidenceRequestReason) {
-          contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-            contextBudgetDiagnostic ??
-              buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-            {
-              synthesisCacheWriteSkipped: 1,
-              synthesisCacheWriteSkippedReasonCounts: {
-                [evidenceRequestReason]: 1,
-              },
-            },
-          );
-        } else {
-          const writePatch = await this.compaction.writeSynthesisCacheBlocks({
-            turnId: input.turnId,
-            query: input.text,
-            hydratedRuntimeEvents: runtimeContext,
-            retrievedArchiveRefs: retrieval.retrievedSourceRefs ?? [],
-            archiveRetrievalMode: contextBudget.archiveRetrieval?.mode ?? 'eager',
-            contextBudget,
-            requestShapeHashBefore: this.priorRequestShape?.requestShapeHash,
-          });
-          contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-            contextBudgetDiagnostic ??
-              buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-            writePatch,
-          );
-        }
-      } else if (
-        contextBudget?.synthesisCache?.enabled === true &&
-        contextBudget.synthesisCache.mode === 'read_write' &&
-        synthesis.selectedBlocks.length === 0 &&
-        (retrieval.diagnosticPatch.retrievedArchiveToolResults ?? 0) === 0
-      ) {
-        contextBudgetDiagnostic = mergeContextBudgetDiagnostic(
-          contextBudgetDiagnostic ??
-            buildContextBudgetDiagnosticShell(priorRuntimeContext, runtimeContext, contextBudget),
-          {
-            synthesisCacheWriteSkipped: 1,
-            synthesisCacheWriteSkippedReasonCounts: { source_missing: 1 },
-          },
-        );
-      }
-    }
-
     // The boundary belongs to the runtime-event projection above. A gate that
     // falls back to the stored-message projection returns a prompt no
     // checkpoint shaped, so it reports none rather than one the request never

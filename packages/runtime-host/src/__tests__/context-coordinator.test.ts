@@ -43,6 +43,7 @@ test('context compaction waits for terminal execution cleanup before preparing',
     runId: 'run-compact',
     status: 'completed' as const,
     terminalEventId: 'event-compact',
+    contextCompactionOutcome: { kind: 'compacted' as const, checkpointId: 'checkpoint-1' },
   };
   const prepare = (): HostedExecutionPreparation => {
     prepareCalls += 1;
@@ -100,6 +101,12 @@ test('context compaction waits for terminal execution cleanup before preparing',
   releaseCleanup();
   const outcome = await compaction;
   assert.equal(outcome.ok, true);
-  if (outcome.ok) assert.deepEqual(outcome.result, compacted);
+  if (outcome.ok) {
+    assert.deepEqual(outcome.result, {
+      kind: 'finished',
+      turn: compacted,
+      outcome: compacted.contextCompactionOutcome,
+    });
+  }
   assert.equal(prepareCalls, 2);
 });

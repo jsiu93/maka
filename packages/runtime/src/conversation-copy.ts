@@ -36,7 +36,7 @@ import {
   validateHistoryCompactCheckpointShape,
 } from './history-compact-checkpoint.js';
 import { findCheckpointSummaryDefect } from './history-compact-summary-validation.js';
-import { isHistoryCompactContentEvent } from './history-compact.js';
+import { isHistoryCompactContentEvent } from './history-compaction.js';
 import {
   classifyTerminalRuntimeLedger,
   commitTerminalRunWithRuntimeFact,

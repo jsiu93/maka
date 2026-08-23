@@ -1486,7 +1486,7 @@ const makaBridge = {
       }
       return send(command);
     },
-    compact(sessionId: string): Promise<void> {
+    compact(sessionId: string): Promise<OperationOutput<'context.compact'>> {
       return invokeSessionRuntimeHost('sessions:compact', sessionId);
     },
     resumeLatest(sessionId: string): Promise<

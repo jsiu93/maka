@@ -38,7 +38,7 @@ import {
 } from '../ai-sdk-flow.js';
 import type { InvocationContext } from '../invocation-context.js';
 import { applyRuntimeEventContextBudget } from '../context-budget.js';
-import { evaluateHistoryCompactCheckpointReplay } from '../history-compact.js';
+import { evaluateHistoryCompactCheckpointReplay } from '../history-compaction.js';
 import type {
   HistoryCompactCheckpoint,
   HistoryCompactProviderState,
@@ -111,7 +111,6 @@ interface MidTurnFixtureOptions {
   useRuntimeDefaultPolicy?: boolean;
   /** Exercise the supported explicit history-compaction escape hatch. */
   historyCompactOff?: boolean;
-  historyBudgetTokens?: number;
   reserveTokens?: number;
   summarize?: (
     input: HistoryCompactSummaryInput,
@@ -502,19 +501,14 @@ function buildFixture(options: MidTurnFixtureOptions = {}): MidTurnFixture {
                   }
                 : {}),
               ...(options.historyCompactOff ? { MAKA_CONTEXT_HISTORY_COMPACT: 'off' } : {}),
-              ...(options.historyBudgetTokens !== undefined
-                ? { MAKA_CONTEXT_HISTORY_BUDGET_TOKENS: String(options.historyBudgetTokens) }
-                : {}),
             },
           },
         )
       : {
           name: 'mid-turn-test',
           maxHistoryEstimatedTokens: 100_000,
-          minRecentTurns: 1,
           historyCompact: {
             enabled: true,
-            mode: 'read_write',
             midTurn: { enabled: true, reserveTokens },
           },
           ...(options.activeToolResultPrune
@@ -843,8 +837,7 @@ function defineMidTurnSuite(consumer: ConsumerMode): void {
     // never re-injected, even though the raw history is below the high water.
     const replay = applyRuntimeEventContextBudget([...fixture.priorEvents, ...fixture.ledger], {
       maxHistoryEstimatedTokens: 100_000,
-      minRecentTurns: 1,
-      historyCompact: { enabled: true, mode: 'read_write', checkpoint },
+      historyCompact: { enabled: true, checkpoint },
     });
 
     assert.ok(replay);
@@ -956,12 +949,6 @@ function defineMidTurnSuite(consumer: ConsumerMode): void {
       (decision) => decision.phase === 'mid_turn' && decision.decision === 'failedOpen',
     );
     assert.equal(failedOpen?.failOpenReason, 'write_failed');
-    // The recorder WAS invoked and failed: exactly that is what the counters say.
-    const usageEvent = fixture.events.find((event) => event.type === 'token_usage') as
-      | { contextBudget?: ContextBudgetDiagnostic }
-      | undefined;
-    assert.equal(usageEvent?.contextBudget?.historyCompactWritesAttempted, 1);
-    assert.equal(usageEvent?.contextBudget?.historyCompactWriteFailures, 1);
   });
 
   test('a malformed summarizer completion fails open end-to-end with its granular reason', async () => {
@@ -1019,8 +1006,6 @@ function defineMidTurnSuite(consumer: ConsumerMode): void {
       (decision) => decision.phase === 'mid_turn' && decision.reason === 'context_budget_exhausted',
     );
     assert.equal(exhaustedDecision?.skippedReasonCounts?.write_failed, 1);
-    assert.equal(lastCall?.contextBudget?.historyCompactWritesAttempted, 1);
-    assert.equal(lastCall?.contextBudget?.historyCompactWriteFailures, 1);
   });
 
   test('fails closed before provider dispatch when the durable ledger read fails', async () => {
@@ -1247,11 +1232,6 @@ function defineMidTurnSuite(consumer: ConsumerMode): void {
     // before any high-water check, so a persisted runaway block would poison
     // every later projection even though this step correctly refused it.
     assert.equal(fixture.recorded.length, 0);
-    // The recorder was never reached, so the diagnostics claim no write.
-    const usageEvent = fixture.events.find((event) => event.type === 'token_usage') as
-      | { contextBudget?: ContextBudgetDiagnostic }
-      | undefined;
-    assert.equal(usageEvent?.contextBudget?.historyCompactWritesAttempted, undefined);
   });
 
   test("the usage baseline is the last request's INPUT tokens — output is not double-counted (review finding 1)", async () => {
@@ -1683,12 +1663,11 @@ describe('mid-turn capacity default-on safety guards (issue #882 PR 3)', () => {
     assert.equal(complete.contextBudgetExhaustedDetail, 'no_safe_completed_span');
   });
 
-  test('keeps multiple bounded recent turns when only their aggregate exceeds the history budget', async () => {
+  test('keeps multiple bounded recent turns below the model capacity', async () => {
     const fixture = buildFixture({
       useRuntimeDefaultPolicy: true,
       contextWindow: 100_000,
       historyCompactOff: true,
-      historyBudgetTokens: 32_000,
       priorChars: 40_000,
     });
     fixture.priorEvents.push(
